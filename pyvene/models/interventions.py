@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from abc import ABC, abstractmethod
+import logging
 
 from .layers import RotateLayer, LowRankRotateLayer, SubspaceLowRankRotateLayer
 from .basic_utils import sigmoid_boundary
@@ -352,6 +353,209 @@ class BoundlessRotatedSpaceIntervention(TrainableIntervention, DistributedRepres
     def __str__(self):
         return f"BoundlessRotatedSpaceIntervention()"
 
+
+
+class ProjectedBoundlessRotatedSpaceIntervention(TrainableIntervention, DistributedRepresentationIntervention):
+    """
+    Intervention in the rotated space with boundary mask, but using random projections
+    for efficiency with very large hidden dimensions.
+
+    This implementation addresses the computational bottleneck of the original
+    BoundlessRotatedSpaceIntervention by using random projections to reduce the
+    dimensionality of the rotation matrix, making it feasible to use with very
+    large models like Bloom-176B.
+    """
+
+    def __init__(self,
+                 **kwargs):
+        super().__init__(**kwargs)
+        # Get projection parameters from kwargs or use defaults
+        self.projection_dim = kwargs.get("projection_dim", self.embed_dim // 4)
+        self.projection_type = kwargs.get("projection_type", "rademacher")
+        self.projection_seed = kwargs.get("projection_seed", 42)
+        self.max_batch_size = kwargs.get("max_batch_size", 32)
+
+        # Set up projector
+        try:
+            from projectors import CudaProjector, BasicProjector
+
+            # Try to use CUDA projector first
+            try:
+                self.projector = CudaProjector(
+                    grad_dim=self.embed_dim,
+                    proj_dim=self.projection_dim,
+                    seed=self.projection_seed,
+                    proj_type=self.projection_type,
+                    device=self.device if hasattr(self, 'device') else "cuda",
+                    max_batch_size=self.max_batch_size
+                )
+                logging.info(f"Using CudaProjector with projection dimension {self.projection_dim}")
+            except (ImportError, RuntimeError, ValueError) as e:
+                logging.warning(f"CudaProjector not available: {e}. Falling back to BasicProjector.")
+                self.projector = BasicProjector(
+                    grad_dim=self.embed_dim,
+                    proj_dim=self.projection_dim,
+                    seed=self.projection_seed,
+                    proj_type=self.projection_type,
+                    device=self.device if hasattr(self, 'device') else "cuda",
+                    block_size=100,
+                    dtype=torch.float32
+                )
+                logging.info(f"Using BasicProjector with projection dimension {self.projection_dim}")
+
+        except ImportError:
+            logging.error("Neither CudaProjector nor BasicProjector available. Using identity projection.")
+            # Create no-op projector class that just returns the input
+            from projectors import NoOpProjector
+            self.projector = NoOpProjector(
+                grad_dim=self.embed_dim,
+                proj_dim=self.embed_dim,
+                seed=self.projection_seed,
+                proj_type=self.projection_type,
+                device=self.device if hasattr(self, 'device') else "cuda"
+            )
+            self.projection_dim = self.embed_dim
+            logging.info("Using NoOpProjector (identity mapping)")
+
+        # Initialize rotation layer in the projected space (smaller dimension)
+        from .layers import RotateLayer
+        rotate_layer = RotateLayer(self.projection_dim)
+        self.rotate_layer = torch.nn.utils.parametrizations.orthogonal(rotate_layer)
+
+        # Initialize learnable boundaries
+        self.intervention_boundaries = torch.nn.Parameter(
+            torch.tensor([0.5]), requires_grad=True
+        )
+        self.temperature = torch.nn.Parameter(torch.tensor(50.0))
+        self.intervention_population = torch.nn.Parameter(
+            torch.arange(0, self.projection_dim), requires_grad=False
+        )
+
+        # Create a learnable mapping to project back to original space
+        # Initialize it to approximate a pseudo-inverse
+        self.back_projection = nn.Parameter(torch.zeros(self.projection_dim, self.embed_dim))
+        self._initialize_back_projection()
+
+    def _initialize_back_projection(self):
+        """Initialize the back-projection to approximate a pseudo-inverse of the projection"""
+        with torch.no_grad():
+            # Generate random vectors to test the forward projection
+            device = self.back_projection.device
+            test_vectors = torch.randn(min(1000, self.embed_dim), self.embed_dim, device=device)
+
+            # Project them forward
+            projected_vectors = []
+            for vec in test_vectors:
+                # Make sure it's shaped correctly for the projector
+                if len(vec.shape) == 1:
+                    vec = vec.unsqueeze(0)
+                proj = self.projector.project(vec, model_id=0)
+                projected_vectors.append(proj.squeeze(0))
+
+            projected_vectors = torch.stack(projected_vectors)
+
+            # Use least squares to find an approximate inverse mapping
+            X = projected_vectors
+            Y = test_vectors
+
+            # Compute pseudo-inverse using SVD
+            try:
+                U, S, V = torch.svd(X)
+                S_inv = torch.zeros_like(S)
+                mask = S > 1e-10
+                S_inv[mask] = 1.0 / S[mask]
+                pseudo_inv = V @ torch.diag(S_inv) @ U.t()
+                approx_mapping = pseudo_inv @ Y
+                self.back_projection.copy_(approx_mapping.t())
+            except Exception as e:
+                logging.warning(f"SVD failed for back-projection initialization: {e}")
+                # Fallback to a simple initialization
+                self.back_projection.normal_(std=1.0 / self.projection_dim)
+
+    def get_boundary_parameters(self):
+        return self.intervention_boundaries
+
+    def get_temperature(self):
+        return self.temperature
+
+    def set_temperature(self, temp: torch.Tensor):
+        self.temperature.data = temp
+
+    def set_intervention_boundaries(self, intervention_boundaries):
+        self.intervention_boundaries = torch.nn.Parameter(
+            torch.tensor([intervention_boundaries]), requires_grad=True
+        )
+
+    def to(self, device):
+        """Override to method to ensure device is properly set for projector"""
+        result = super().to(device)
+        if hasattr(self.projector, 'device'):
+            self.projector.device = device
+        return result
+
+    def forward(self, base, source, subspaces=None):
+        """
+        Apply boundary-based intervention in the projected, rotated space
+
+        Args:
+            base: Base representations [batch_size, embed_dim]
+            source: Source representations [batch_size, embed_dim]
+            subspaces: Optional subspace specification
+
+        Returns:
+            Intervened representations [batch_size, embed_dim]
+        """
+        batch_size = base.shape[0]
+
+        # Project base and source to lower-dimensional space
+        rotated_base = self.project_and_rotate(base)
+        rotated_source = self.project_and_rotate(source)
+
+        # Get boundary mask
+        intervention_boundaries = torch.clamp(self.intervention_boundaries, 1e-3, 1)
+        boundary_mask = sigmoid_boundary(
+            self.intervention_population.repeat(batch_size, 1),
+            0.0,
+            intervention_boundaries[0] * int(self.projection_dim),
+            self.temperature,
+        )
+        boundary_mask = (
+                torch.ones(batch_size, device=base.device).unsqueeze(dim=-1) * boundary_mask
+        )
+        boundary_mask = boundary_mask.to(rotated_base.dtype)
+
+        # Interchange in the projected, rotated space
+        rotated_output = (
+                                 1.0 - boundary_mask
+                         ) * rotated_base + boundary_mask * rotated_source
+
+        # Unrotate and project back to original space
+        output = self.unrotate_and_project_back(rotated_output)
+
+        return output.to(base.dtype)
+
+    def project_and_rotate(self, x):
+        """Project to lower dimension and apply rotation"""
+        # Project to lower dimension
+        projected_x = self.projector.project(x, model_id=0)
+
+        # Apply rotation in the projected space
+        rotated_x = self.rotate_layer(projected_x)
+
+        return rotated_x
+
+    def unrotate_and_project_back(self, x):
+        """Apply inverse rotation and project back to original dimension"""
+        # Unrotate in the projected space
+        unrotated_x = torch.matmul(x, self.rotate_layer.weight.T)
+
+        # Project back to original space using learned mapping
+        original_x = F.linear(unrotated_x, self.back_projection)
+
+        return original_x
+
+    def __str__(self):
+        return f"ProjectedBoundlessRotatedSpaceIntervention(projection_dim={self.projection_dim})"
 
 class SigmoidMaskRotatedSpaceIntervention(TrainableIntervention, DistributedRepresentationIntervention):
 

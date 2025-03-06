@@ -72,7 +72,8 @@ def create_llama(
         name,
         config=config,
         cache_dir=cache_dir,
-        torch_dtype=dtype,  # save memory
+        torch_dtype=dtype,
+        device_map="auto", # save memory
     )
     print("loaded model")
     return config, tokenizer, llama
